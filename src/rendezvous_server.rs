@@ -48,6 +48,7 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+const TCP_HEARTBEAT_INTERVAL: u64 = 30;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -508,6 +509,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        tcp_heartbeat: &mut bool,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -574,11 +576,21 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let (res, keep_alive) =
+                        if !rk.id.is_empty() && !rk.uuid.is_empty() && !rk.pk.is_empty() {
+                            *tcp_heartbeat = true;
+                            (
+                                register_pk_response::Result::OK,
+                                TCP_HEARTBEAT_INTERVAL as _,
+                            )
+                        } else {
+                            (register_pk_response::Result::NOT_SUPPORT, 0)
+                        };
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: res.into(),
+                        keep_alive,
                         ..Default::default()
                     });
                     Self::send_to_sink(sink, msg_out).await;
@@ -858,6 +870,20 @@ impl RendezvousServer {
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
                     }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    async fn send_tcp_heartbeat(sink: &mut Option<Sink>) {
+        if let Some(sink) = sink.as_mut() {
+            match sink {
+                Sink::TcpStream(s) => {
+                    allow_err!(s.send(Bytes::new()).await);
+                }
+                Sink::Ws(ws) => {
+                    allow_err!(ws.send(tungstenite::Message::Binary(Vec::new())).await);
                 }
             }
         }
@@ -1178,6 +1204,8 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let mut tcp_heartbeat = false;
+        let mut heartbeat_timer = interval(Duration::from_secs(TCP_HEARTBEAT_INTERVAL));
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1207,19 +1235,39 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
+            loop {
+                tokio::select! {
+                    _ = heartbeat_timer.tick(), if tcp_heartbeat => {
+                        Self::send_tcp_heartbeat(&mut sink).await;
+                    }
+                    res = timeout(30_000, b.next()) => {
+                        let Ok(Some(Ok(msg))) = res else {
+                            break;
+                        };
+                        if let tungstenite::Message::Binary(bytes) = msg {
+                            if !bytes.is_empty() && !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &mut tcp_heartbeat).await {
+                                break;
+                            }
+                        }
                     }
                 }
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
+            loop {
+                tokio::select! {
+                    _ = heartbeat_timer.tick(), if tcp_heartbeat => {
+                        Self::send_tcp_heartbeat(&mut sink).await;
+                    }
+                    res = timeout(30_000, b.next()) => {
+                        let Ok(Some(Ok(bytes))) = res else {
+                            break;
+                        };
+                        if !bytes.is_empty() && !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &mut tcp_heartbeat).await {
+                            break;
+                        }
+                    }
                 }
             }
         }
